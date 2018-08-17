@@ -2147,10 +2147,12 @@ calculate_expected (GstRtpJitterBuffer * jitterbuffer, guint32 expected,
     priv->last_in_dts += gap_time;
   }
 
-  expected_dts = priv->last_in_dts + (lost_packets + 1) * duration;
+  expected_dts = priv->last_in_dts + 2*duration;
 
   if (priv->do_retransmission) {
     TimerData *timer;
+
+    expected_dts = priv->last_in_dts + (lost_packets + 1) * duration;
 
     type = TIMER_TYPE_EXPECTED;
     /* if we had a timer for the first missing packet, update it. */
