@@ -1467,7 +1467,7 @@ gst_rtp_jitter_buffer_src_event (GstPad * pad, GstObject * parent,
       /* adjust the overall buffer delay to the total pipeline latency in
        * buffering mode because if downstream consumes too fast (because of
        * large latency or queues, we would start rebuffering again. */
-      if (rtp_jitter_buffer_get_mode (priv->jbuf) ==
+      if ( latency > priv->latency_ns && rtp_jitter_buffer_get_mode (priv->jbuf) ==
           RTP_JITTER_BUFFER_MODE_BUFFER) {
         rtp_jitter_buffer_set_delay (priv->jbuf, latency);
       }
@@ -2120,9 +2120,16 @@ calculate_expected (GstRtpJitterBuffer * jitterbuffer, guint32 expected,
       GST_TIME_ARGS (duration));
 
   if (total_duration > priv->latency_ns) {
-    GstClockTime gap_time;
+    GstClockTime gap_time = total_duration;
 
-    gap_time = total_duration - priv->latency_ns;
+    /* In our scenario, there is no need to route packets when they are transmitted.
+     * In the absence of NACK, if the data packets are found to be discontinuous,
+     * it is clear that these packets have been lost, and there is no need for the
+     * timer to make a timeout judgment.
+    */
+    if(priv->do_retransmission) {
+        gap_time -= priv->latency_ns;
+    }
 
     if (duration > 0) {
       lost_packets = gap_time / duration;
@@ -2147,7 +2154,7 @@ calculate_expected (GstRtpJitterBuffer * jitterbuffer, guint32 expected,
     priv->last_in_dts += gap_time;
   }
 
-  expected_dts = priv->last_in_dts + 2*duration;
+  expected_dts = priv->last_in_dts + duration;
 
   if (priv->do_retransmission) {
     TimerData *timer;
