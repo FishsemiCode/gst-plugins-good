@@ -215,8 +215,8 @@ rtp_jitter_buffer_reset_skew (RTPJitterBuffer * jbuf)
   jbuf->last_rtptime = -1;
   jbuf->window_pos = 0;
   jbuf->window_filling = TRUE;
-  jbuf->window_min = 0;
-  jbuf->skew = 0;
+  jbuf->window_min = G_MAXUINT64;
+  jbuf->skew = jbuf->high_level;
   jbuf->prev_send_diff = -1;
   jbuf->prev_out_time = -1;
   jbuf->need_resync = TRUE;
@@ -248,9 +248,9 @@ rtp_jitter_buffer_resync (RTPJitterBuffer * jbuf, GstClockTime time,
   if (reset_skew) {
     jbuf->window_filling = TRUE;
     jbuf->window_pos = 0;
-    jbuf->window_min = 0;
+    jbuf->window_min = G_MAXUINT64;
     jbuf->window_size = 0;
-    jbuf->skew = 0;
+    jbuf->skew = jbuf->high_level;
   }
   jbuf->need_resync = FALSE;
 }
@@ -418,8 +418,15 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
 
   ext_rtptime = gst_rtp_buffer_ext_timestamp (&jbuf->ext_rtptime, rtptime);
 
-  if (jbuf->last_rtptime != -1 && ext_rtptime == jbuf->last_rtptime)
-    return jbuf->prev_out_time;
+  if (jbuf->last_rtptime != -1 && ext_rtptime == jbuf->last_rtptime) {
+      /*
+       *Packets with the same timestamp are only used to calculate jitter for once,
+       *try calculate every time
+      */
+      gint64 delay_ms = jbuf->delay/1000000;
+      if((delay_ms % 10) == 1)       //if init delay with x*10 + 1, return
+         return jbuf->prev_out_time;
+  }
 
   gstrtptime =
       gst_util_uint64_scale_int (ext_rtptime, GST_SECOND, jbuf->clock_rate);
@@ -500,14 +507,15 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
     if (G_UNLIKELY (pos == 1 || delta < jbuf->window_min))
       jbuf->window_min = delta;
 
-    if (G_UNLIKELY (send_diff >= MAX_TIME || pos >= MAX_WINDOW)) {
+    /*
+     * ensure the minimum size of window reaches 1/4 of the window;
+     * current window size is 256, window / 4 = 64, about two seconds of data
+    */
+    if (G_UNLIKELY ((send_diff >= MAX_TIME && jbuf->window_size * 4 > MAX_WINDOW) || pos >= MAX_WINDOW)) {
       jbuf->window_size = pos;
 
       /* window filled */
-      GST_DEBUG ("min %" G_GINT64_FORMAT, jbuf->window_min);
-
-      /* the skew is now the min */
-      jbuf->skew = jbuf->window_min;
+      GST_DEBUG ("end the filling of window, min %" G_GINT64_FORMAT, jbuf->window_min);
       jbuf->window_filling = FALSE;
     } else {
       gint perc_time, perc_window, perc;
@@ -524,6 +532,8 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
 
       /* quickly go to the min value when we are filling up, slowly when we are
        * just starting because we're not sure it's a good value yet. */
+      GST_DEBUG ("filling, jbuf->skew %" G_GINT64_FORMAT " jbuf->window_min %" G_GINT64_FORMAT,
+                 jbuf->skew, jbuf->window_min);
       jbuf->skew =
           (perc * jbuf->window_min + ((10000 - perc) * jbuf->skew)) / 10000;
       jbuf->window_size = pos + 1;
@@ -534,30 +544,27 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
     old = jbuf->window[pos];
     jbuf->window[pos++] = delta;
 
-    if (G_UNLIKELY (delta <= jbuf->window_min)) {
-      /* if the new value we inserted is smaller or equal to the current min,
-       * it becomes the new min */
-      jbuf->window_min = delta;
-    } else if (G_UNLIKELY (old == jbuf->window_min)) {
-      gint64 min = G_MAXINT64;
+    if (G_LIKELY (old != jbuf->window_min)) {
+      gint64 dleta_total = 0;
 
       /* if we removed the old min, we have to find a new min */
       for (i = 0; i < jbuf->window_size; i++) {
-        /* we found another value equal to the old min, we can stop searching now */
-        if (jbuf->window[i] == old) {
-          min = old;
-          break;
-        }
-        if (jbuf->window[i] < min)
-          min = jbuf->window[i];
+          dleta_total += jbuf->window[i];
       }
-      jbuf->window_min = min;
+      jbuf->window_min = (dleta_total - delta)/(jbuf->window_size - 1);
+      jbuf->window_min = (delta + (15 * jbuf->window_min)) >> 4;
     }
     /* average the min values */
-    jbuf->skew = (jbuf->window_min + (124 * jbuf->skew)) / 125;
+    jbuf->skew = (jbuf->window_min * 3  + (97 * jbuf->skew)) / 100;
     GST_DEBUG ("delta %" G_GINT64_FORMAT ", new min: %" G_GINT64_FORMAT,
         delta, jbuf->window_min);
   }
+
+  if(jbuf->skew < (gint64)jbuf->low_level) {
+      GST_DEBUG ("set skew %" G_GINT64_FORMAT " to low_level %" G_GINT64_FORMAT , jbuf->skew, jbuf->low_level);
+      jbuf->skew = (gint64)jbuf->low_level;
+  }
+
   /* wrap around in the window */
   if (G_UNLIKELY (pos >= jbuf->window_size))
     pos = 0;
@@ -591,7 +598,7 @@ no_skew:
         out_time = jbuf->prev_out_time;
       }
     }
-    if (time != -1 && out_time + jbuf->delay < time) {
+    if (time != -1 && out_time + jbuf->delay * 2 < time) {
       /* if we are going to produce a timestamp that is later than the input
        * timestamp, we need to reset the jitterbuffer. Likely the server paused
        * temporarily */
@@ -601,6 +608,10 @@ no_skew:
       rtp_jitter_buffer_resync (jbuf, time, gstrtptime, ext_rtptime, TRUE);
       out_time = time;
       send_diff = 0;
+    }
+    if G_UNLIKELY(out_time < time) {
+      GST_DEBUG ("set out_time to current time");
+      out_time = time;
     }
   } else
     out_time = -1;

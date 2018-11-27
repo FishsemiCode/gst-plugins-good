@@ -65,7 +65,7 @@ typedef enum {
 #define RTP_TYPE_JITTER_BUFFER_MODE (rtp_jitter_buffer_mode_get_type())
 GType rtp_jitter_buffer_mode_get_type (void);
 
-#define RTP_JITTER_BUFFER_MAX_WINDOW 512
+#define RTP_JITTER_BUFFER_MAX_WINDOW 256
 /**
  * RTPJitterBuffer:
  *
