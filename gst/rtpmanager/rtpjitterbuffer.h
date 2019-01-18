@@ -102,6 +102,7 @@ struct _RTPJitterBuffer {
   gint64         skew;
   gint64         prev_send_diff;
   gboolean       buffering_disabled;
+  guint64        stable_count;
 };
 
 struct _RTPJitterBufferClass {

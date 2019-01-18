@@ -216,10 +216,11 @@ rtp_jitter_buffer_reset_skew (RTPJitterBuffer * jbuf)
   jbuf->window_pos = 0;
   jbuf->window_filling = TRUE;
   jbuf->window_min = G_MAXUINT64;
-  jbuf->skew = jbuf->high_level;
+  jbuf->skew = jbuf->low_level;
   jbuf->prev_send_diff = -1;
   jbuf->prev_out_time = -1;
   jbuf->need_resync = TRUE;
+  jbuf->stable_count = 0;
   GST_DEBUG ("reset skew correction");
 }
 
@@ -250,8 +251,9 @@ rtp_jitter_buffer_resync (RTPJitterBuffer * jbuf, GstClockTime time,
     jbuf->window_pos = 0;
     jbuf->window_min = G_MAXUINT64;
     jbuf->window_size = 0;
-    jbuf->skew = jbuf->high_level;
+    jbuf->skew = jbuf->low_level;
   }
+  jbuf->stable_count = 0;
   jbuf->need_resync = FALSE;
 }
 
@@ -482,9 +484,28 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
   else
     slope = 8;
 
+  if(slope == 7 || slope == 8) {
+    jbuf->stable_count++;
+  } else {
+    jbuf->stable_count = 0;
+  }
+
   GST_DEBUG ("time %" GST_TIME_FORMAT ", base %" GST_TIME_FORMAT ", recv_diff %"
-      GST_TIME_FORMAT ", slope %" G_GUINT64_FORMAT, GST_TIME_ARGS (time),
-      GST_TIME_ARGS (jbuf->base_time), GST_TIME_ARGS (recv_diff), slope);
+      GST_TIME_FORMAT ", slope %" G_GUINT64_FORMAT ", slope stable count %" G_GUINT64_FORMAT, GST_TIME_ARGS (time),
+      GST_TIME_ARGS (jbuf->base_time), GST_TIME_ARGS (recv_diff), slope, jbuf->stable_count);
+
+  /* out_time = time + (-delta) + skew
+   * if delta is biggger than -(jbuf->delay * 5), reset the base time,
+   * and set the delay to skew, in order to make playback more smooth
+  */
+  if ((delta + (gint64)jbuf->delay * 5) < 0) {
+    GST_WARNING ("delta : %" G_GINT64_FORMAT " , reset skew", delta);
+    rtp_jitter_buffer_resync (jbuf, time, gstrtptime, ext_rtptime, TRUE);
+
+    jbuf->skew = jbuf->delay * 5;
+    send_diff = 0;
+    delta = 0;
+  }
 
   /* if the difference between the sender timeline and the receiver timeline
    * changed too quickly we have to resync because the server likely restarted
@@ -497,15 +518,28 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
     delta = 0;
   }
 
+  if(jbuf->stable_count > 60 && (delta + (gint64)jbuf->delay) < 0 ) {
+    GST_WARNING ("long time in stable state, reset base time, in order to get a close base time");
+
+    gint64 skew = jbuf->skew - delta;
+    rtp_jitter_buffer_resync (jbuf, time, gstrtptime, ext_rtptime, TRUE);
+    jbuf->skew = skew;
+    send_diff = 0;
+    delta = 0;
+  }
+
   pos = jbuf->window_pos;
 
   if (G_UNLIKELY (jbuf->window_filling)) {
     /* we are filling the window */
     GST_DEBUG ("filling %d, delta %" G_GINT64_FORMAT, pos, delta);
     jbuf->window[pos++] = delta;
-    /* calc the min delta we observed */
-    if (G_UNLIKELY (pos == 1 || delta < jbuf->window_min))
+    /* calc the mean delta we observed */
+    if (G_UNLIKELY (pos == 1)) {
       jbuf->window_min = delta;
+    } else {
+      jbuf->window_min = (jbuf->window_min * (pos - 1) + delta) / pos;
+    }
 
     /*
      * ensure the minimum size of window reaches 1/4 of the window;
@@ -563,6 +597,7 @@ calculate_skew (RTPJitterBuffer * jbuf, guint32 rtptime, GstClockTime time)
   if(jbuf->skew < (gint64)jbuf->low_level) {
       GST_DEBUG ("set skew %" G_GINT64_FORMAT " to low_level %" G_GINT64_FORMAT , jbuf->skew, jbuf->low_level);
       jbuf->skew = (gint64)jbuf->low_level;
+      GST_DEBUG ("now skew is %" G_GINT64_FORMAT , jbuf->skew);
   }
 
   /* wrap around in the window */
@@ -609,6 +644,7 @@ no_skew:
       out_time = time;
       send_diff = 0;
     }
+
     if G_UNLIKELY(out_time < time) {
       GST_DEBUG ("set out_time to current time");
       out_time = time;
